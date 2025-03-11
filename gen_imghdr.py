@@ -27,6 +27,7 @@ import argparse
 import binascii
 import struct
 import sys
+import os
 
 def any_int(x):
     try:
@@ -38,7 +39,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("ifile", help="Input application binary (binary)")
 parser.add_argument("ofile", help="Output header file (binary)")
 parser.add_argument("-a", "--addr", help="Load address of the application image",
-                    type=any_int, default=0x10004000)
+                    type=any_int, default=0x10008000)
 args = parser.parse_args()
 
 try:

@@ -6,7 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "RP2040.h"
+#include "RP2350.h"
 #include "pico/time.h"
 #include "hardware/dma.h"
 #include "hardware/flash.h"
@@ -19,11 +19,15 @@
 
 #ifdef DEBUG
 #include <stdio.h>
-#include "pico/stdio_usb.h"
-#define DBG_PRINTF_INIT() stdio_usb_init()
+#include "pico/stdio_uart.h"
+#define DBG_PRINTF_INIT() stdio_uart_init()
+#define DBG_PRINTF_DEINIT() stdio_uart_deinit()
+
 #define DBG_PRINTF(...) printf(__VA_ARGS__)
 #else
 #define DBG_PRINTF_INIT() { }
+#define DBG_PRINTF_DEINIT() { }
+
 #define DBG_PRINTF(...) { }
 #endif
 
@@ -34,9 +38,26 @@
 #define BOOTLOADER_ENTRY_PIN 15
 #define BOOTLOADER_ENTRY_MAGIC 0xb105f00d
 
-#define UART_TX_PIN 0
-#define UART_RX_PIN 1
-#define UART_BAUD   921600
+
+
+#ifndef PICO_FLASH_SPI_CLKDIV
+#define PICO_FLASH_SPI_CLKDIV 2
+#endif
+
+// pico_cmake_set_default PICO_FLASH_SIZE_BYTES = (2 * 1024 * 1024)
+#ifndef PICO_FLASH_SIZE_BYTES
+#define PICO_BOOT_STAGE2_CHOOSE_W25Q080 1
+#define PICO_FLASH_SIZE_BYTES (2 * 1024 * 1024)
+#endif
+
+#define GPIO_BLE_RST 43
+
+#define GPIO_BLE_INT 39
+
+#define UART_TX_PIN 40
+#define UART_RX_PIN 41
+
+#define UART_BAUD   115200
 
 #define CMD_SYNC   (('S' << 0) | ('Y' << 8) | ('N' << 16) | ('C' << 24))
 #define CMD_READ   (('R' << 0) | ('E' << 8) | ('A' << 16) | ('D' << 24))
@@ -53,7 +74,7 @@
 #define RSP_OK   (('O' << 0) | ('K' << 8) | ('O' << 16) | ('K' << 24))
 #define RSP_ERR  (('E' << 0) | ('R' << 8) | ('R' << 16) | ('!' << 24))
 
-#define IMAGE_HEADER_OFFSET (12 * 1024)
+#define IMAGE_HEADER_OFFSET (28 * 1024)
 
 #define WRITE_ADDR_MIN (XIP_BASE + IMAGE_HEADER_OFFSET + FLASH_SECTOR_SIZE)
 #define ERASE_ADDR_MIN (XIP_BASE + IMAGE_HEADER_OFFSET)
@@ -416,9 +437,9 @@ struct image_header {
 	uint32_t vtor;
 	uint32_t size;
 	uint32_t crc;
-	uint8_t pad[FLASH_PAGE_SIZE - (3 * 4)];
+	uint8_t pad[FLASH_PAGE_SIZE*4 - (3 * 4)];
 };
-static_assert(sizeof(struct image_header) == FLASH_PAGE_SIZE, "image_header must be FLASH_PAGE_SIZE bytes");
+static_assert(sizeof(struct image_header) == (FLASH_PAGE_SIZE * 4), "image_header must be FLASH_PAGE_SIZE bytes");
 
 static bool image_header_ok(struct image_header *hdr)
 {
@@ -476,6 +497,7 @@ static uint32_t handle_seal(uint32_t *args_in, uint8_t *data_in, uint32_t *resp_
 
 static uint32_t handle_go(uint32_t *args_in, uint8_t *data_in, uint32_t *resp_args_out, uint8_t *resp_data_out)
 {
+	DBG_PRINTF_DEINIT();
 	disable_interrupts();
 
 	reset_peripherals();
@@ -574,11 +596,9 @@ static enum state state_wait_for_sync(struct cmd_context *ctx)
 
 	ctx->status = CMD_SYNC;
 
-	gpio_put(PICO_DEFAULT_LED_PIN, 1);
 
 	while (idx < sizeof(ctx->opcode)) {
-		uart_read_blocking(uart0, &recv[idx], 1);
-		gpio_xor_mask((1 << PICO_DEFAULT_LED_PIN));
+		uart_read_blocking(uart1, &recv[idx], 1);
 
 		if (recv[idx] != match[idx]) {
 			// Start again
@@ -593,12 +613,29 @@ static enum state state_wait_for_sync(struct cmd_context *ctx)
 
 	return STATE_READ_ARGS;
 }
-
+static bool bo_uart_read_timeout(uart_inst_t *uart, uint8_t *dst, size_t len)
+{
+	size_t i = 0;
+	for (; i < len;) 
+	{
+		if(gpio_get(GPIO_BLE_INT) == 0)
+		{
+			break;
+		}
+        while(uart_is_readable(uart) && i < len)
+		{
+			*dst++ = (uint8_t) uart_get_hw(uart)->dr;
+			i++;
+		}
+    }
+	return i == len;
+}
 static enum state state_read_opcode(struct cmd_context *ctx)
 {
-	uart_read_blocking(uart0, (uint8_t *)&ctx->opcode, sizeof(ctx->opcode));
-
-	return STATE_READ_ARGS;
+	if(bo_uart_read_timeout(uart1, (uint8_t *)&ctx->opcode, sizeof(ctx->opcode)))
+		return STATE_READ_ARGS;
+	else
+		return STATE_WAIT_FOR_SYNC;
 }
 
 static enum state state_read_args(struct cmd_context *ctx)
@@ -616,9 +653,10 @@ static enum state state_read_args(struct cmd_context *ctx)
 	ctx->resp_args = ctx->args;
 	ctx->resp_data = (uint8_t *)(ctx->resp_args + desc->resp_nargs);
 
-	uart_read_blocking(uart0, (uint8_t *)ctx->args, sizeof(*ctx->args) * desc->nargs);
-
-	return STATE_READ_DATA;
+	if(bo_uart_read_timeout(uart1, (uint8_t *)ctx->args, sizeof(*ctx->args) * desc->nargs))
+		return STATE_READ_DATA;
+	else
+		return STATE_WAIT_FOR_SYNC;
 }
 
 static enum state state_read_data(struct cmd_context *ctx)
@@ -637,9 +675,10 @@ static enum state state_read_data(struct cmd_context *ctx)
 
 	// TODO: Check sizes
 
-	uart_read_blocking(uart0, (uint8_t *)ctx->data, ctx->data_len);
-
-	return STATE_HANDLE_DATA;
+	if(bo_uart_read_timeout(uart1, (uint8_t *)ctx->data, ctx->data_len))
+		return STATE_HANDLE_DATA;
+	else
+		return STATE_WAIT_FOR_SYNC;
 }
 
 static enum state state_handle_data(struct cmd_context *ctx)
@@ -658,7 +697,7 @@ static enum state state_handle_data(struct cmd_context *ctx)
 
 	size_t resp_len = sizeof(ctx->status) + (sizeof(*ctx->resp_args) * desc->resp_nargs) + ctx->resp_data_len;
 	memcpy(ctx->uart_buf, &ctx->status, sizeof(ctx->status));
-	uart_write_blocking(uart0, ctx->uart_buf, resp_len);
+	uart_write_blocking(uart1, ctx->uart_buf, resp_len);
 
 	return STATE_READ_OPCODE;
 }
@@ -667,7 +706,7 @@ static enum state state_error(struct cmd_context *ctx)
 {
 	size_t resp_len = sizeof(ctx->status);
 	memcpy(ctx->uart_buf, &ctx->status, sizeof(ctx->status));
-	uart_write_blocking(uart0, ctx->uart_buf, resp_len);
+	uart_write_blocking(uart1, ctx->uart_buf, resp_len);
 
 	return STATE_WAIT_FOR_SYNC;
 }
@@ -677,21 +716,12 @@ static bool should_stay_in_bootloader()
 	bool wd_says_so = (watchdog_hw->scratch[5] == BOOTLOADER_ENTRY_MAGIC) &&
 		(watchdog_hw->scratch[6] == ~BOOTLOADER_ENTRY_MAGIC);
 
-	return !gpio_get(BOOTLOADER_ENTRY_PIN) || wd_says_so;
+	return wd_says_so;
 }
 
 int main(void)
 {
-	gpio_init(PICO_DEFAULT_LED_PIN);
-	gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
-	gpio_put(PICO_DEFAULT_LED_PIN, 1);
-
-	gpio_init(BOOTLOADER_ENTRY_PIN);
-	gpio_pull_up(BOOTLOADER_ENTRY_PIN);
-	gpio_set_dir(BOOTLOADER_ENTRY_PIN, 0);
-
 	sleep_ms(10);
-
 	struct image_header *hdr = (struct image_header *)(XIP_BASE + IMAGE_HEADER_OFFSET);
 
 	if (!should_stay_in_bootloader() && image_header_ok(hdr)) {
@@ -700,15 +730,42 @@ int main(void)
 		reset_peripherals();
 		jump_to_vtor(vtor);
 	}
+	gpio_init(GPIO_BLE_INT);
+    gpio_init(GPIO_BLE_RST);
 
+	gpio_set_dir(GPIO_BLE_INT, false);
+	gpio_set_outover(GPIO_BLE_INT, IO_BANK0_GPIO0_CTRL_OUTOVER_VALUE_NORMAL);
+
+	gpio_set_pulls(GPIO_BLE_INT, false, true);
+	gpio_set_dir(GPIO_BLE_RST, true);
+	gpio_set_outover(GPIO_BLE_RST, IO_BANK0_GPIO0_CTRL_OUTOVER_VALUE_NORMAL);
+
+	gpio_put(GPIO_BLE_RST, 0);
+	sleep_ms(500);
+	gpio_put(GPIO_BLE_RST, 1);
+	sleep_ms(500);
+	gpio_put(GPIO_BLE_RST, 0);
 	DBG_PRINTF_INIT();
-
-	uart_init(uart0, UART_BAUD);
+	uart_init(uart1, 19200);
 	gpio_set_function(UART_TX_PIN, GPIO_FUNC_UART);
 	gpio_set_function(UART_RX_PIN, GPIO_FUNC_UART);
-	uart_set_hw_flow(uart0, false, false);
+	uart_set_hw_flow(uart1, false, false);
+	sleep_ms(500);
+	{
+		char app_c[] = "<ST_BAUD=230400>";
+		uart_write_blocking(uart1, (uint8_t*)app_c, strlen(app_c));
+		sleep_ms(500);
+		uart_init(uart1, 230400);
+		gpio_set_function(UART_TX_PIN, GPIO_FUNC_UART);
+		gpio_set_function(UART_RX_PIN, GPIO_FUNC_UART);
+		uart_set_hw_flow(uart1, false, false);
+		sleep_ms(50);
+		char Cmd[50] = { 0 };
+		snprintf((char*)Cmd, sizeof(Cmd) ,"<ST_NAME=%s>", "C8S_BLELOADER");
+		uart_write_blocking(uart1, (uint8_t*)Cmd, strlen(Cmd));
 
-	struct cmd_context ctx;
+	}
+	struct cmd_context ctx = {};
 	uint8_t uart_buf[(sizeof(uint32_t) * (1 + MAX_NARG)) + MAX_DATA_LEN];
 	ctx.uart_buf = uart_buf;
 	enum state state = STATE_WAIT_FOR_SYNC;
@@ -717,6 +774,8 @@ int main(void)
 		switch (state) {
 		case STATE_WAIT_FOR_SYNC:
 			DBG_PRINTF("wait_for_sync\n");
+			sleep_ms(2000);
+			DBG_PRINTF("wait_for_sync1\n");
 			state = state_wait_for_sync(&ctx);
 			DBG_PRINTF("wait_for_sync done\n");
 			break;

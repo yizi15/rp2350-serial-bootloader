@@ -1,0 +1,31 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Pico Debug",
+            "cwd": "${workspaceRoot}",
+            // "showDevDebugOutput": "raw",
+            "executable": "${command:cmake.launchTargetPath}",
+            "request": "launch",
+            "type": "cortex-debug",
+            "servertype": "openocd",
+            // This may need to be "arm-none-eabi-gdb" for some previous builds
+            "gdbPath" : "arm-none-eabi-gdb",
+            "device": "RP2350",
+            "searchDir":    ["F:\\PICO\\pico-sdk\\openocd-sdk-2.0.0\\tcl"],
+            "configFiles": [
+                "interface/jlink.cfg",
+                "${workspaceRoot}/this_ocd.cfg",
+                "target/rp2350.cfg"
+            ],
+            // "preLaunchTask": "flash",
+            "svdFile": "${env:PICO_SDK_PATH}/src/rp2350/hardware_regs/rp2350.svd",
+            "runToEntryPoint": "main",
+            // Work around for stopping at main on restart
+            "postRestartCommands": [
+                "break main",
+                "continue"
+            ]
+        }
+    ]
+}

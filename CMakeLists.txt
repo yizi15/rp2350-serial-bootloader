@@ -24,6 +24,11 @@
 
 cmake_minimum_required(VERSION 3.13)
 
+set(PICO_PLATFORM "rp2350")
+
+set(PICO_BOARD "none")
+set(PICO_CMSIS_DEVICE RP2350)
+
 include(pico_sdk_import.cmake)
 
 project(test_project C CXX ASM)
@@ -37,6 +42,11 @@ pico_sdk_init()
 
 add_executable(bootloader main.c)
 
+# add_definitions(-DDEBUG)
+# add_definitions(-DPICO_DEFAULT_UART_TX_PIN=44 -DPICO_DEFAULT_UART_RX_PIN=45)
+# add_definitions(-DPICO_DEFAULT_UART=0)
+# add_definitions(-DPICO_DEFAULT_UART_BAUD_RATE=921600)
+
 function(target_cl_options option)
     target_compile_options(bootloader PRIVATE ${option})
     target_link_options(bootloader PRIVATE ${option})
@@ -47,12 +57,12 @@ target_cl_options("-ffunction-sections")
 target_cl_options("-fdata-sections")
 target_link_options(bootloader PRIVATE "LINKER:--gc-sections")
 
-pico_add_extra_outputs(bootloader)
-pico_set_binary_type(bootloader copy_to_ram)
+pico_add_bin_output(bootloader)
+#pico_set_binary_type(bootloader copy_to_ram)
 
 set_target_properties(bootloader PROPERTIES COMPILE_FLAGS "-Wall")
 
-pico_set_linker_script(bootloader ${CMAKE_CURRENT_SOURCE_DIR}/bootloader.ld)
+#pico_set_linker_script(bootloader ${CMAKE_CURRENT_SOURCE_DIR}/bootloader.ld)
 
 target_link_libraries(bootloader
                       pico_stdlib
@@ -89,39 +99,22 @@ endfunction()
 bootloader_define_library()
 
 # Provide a helper to build a combined target
-
 function(bootloader_build_combined NAME)
-	set(APP ${NAME}_app)
-	set(APP_BIN ${CMAKE_CURRENT_BINARY_DIR}/${APP}.bin)
-	set(APP_HDR ${CMAKE_CURRENT_BINARY_DIR}/${APP}_hdr.bin)
+	set(APP_BIN ${CMAKE_CURRENT_BINARY_DIR}/${NAME}.bin)
 
 	set(COMBINED ${NAME}_combined)
 
-	target_link_libraries(${NAME} bootloader_library)
+	target_link_libraries(${NAME} PRIVATE bootloader_library)
 
 	pico_set_linker_script(${NAME} ${BOOTLOADER_DIR}/combined.ld)
 
 	pico_add_bin_output(${NAME})
+	message(${APP_BIN})
 
-	# TODO: The hard-coded 16k here is a bit nasty
-	add_custom_target(${APP}_bin DEPENDS ${APP_BIN})
-	add_custom_command(OUTPUT ${APP_BIN} DEPENDS ${NAME}.bin
-		COMMAND dd ibs=1k iseek=16 if=${NAME}.bin of=${APP_BIN}
-	)
+	add_custom_target(${COMBINED} DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/${COMBINED}.elf)
+	add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/${COMBINED}.elf DEPENDS ${APP_BIN}
+	COMMAND ${Python3_EXECUTABLE} ${BOOTLOADER_DIR}/combined.py ${NAME} ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_OBJCOPY})
 
-	# TODO: The hard-coded address here is a bit nasty
-	add_custom_target(${APP}_hdr DEPENDS ${APP}_bin)
-	add_custom_command(OUTPUT ${APP_HDR} DEPENDS ${APP_BIN}
-		COMMAND ${BOOTLOADER_DIR}/gen_imghdr.py -a 0x10004000 ${APP_BIN} ${APP_HDR}
-	)
-
-	add_custom_target(${COMBINED} ALL DEPENDS ${APP_HDR})
-	add_custom_command(TARGET ${COMBINED} DEPENDS ${APP_HDR}
-		COMMAND ${CMAKE_OBJCOPY} --update-section .app_hdr=${APP_HDR} ${NAME}.elf ${COMBINED}.elf
-	)
-	add_custom_command(TARGET ${COMBINED} POST_BUILD
-		COMMAND ${CMAKE_OBJCOPY} -Obinary ${COMBINED}.elf ${COMBINED}.bin
-	)
 endfunction()
 
 # Provide a helper to build a standalone target
